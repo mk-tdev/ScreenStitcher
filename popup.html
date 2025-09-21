@@ -1,0 +1,159 @@
+<!DOCTYPE html>
+<html>
+  <head>
+    <meta charset="utf-8" />
+    <link rel="stylesheet" href="popup.css" />
+  </head>
+  <body>
+    <div class="container">
+      <div class="header">
+        <h1>ScreenStitcher</h1>
+        <div class="counter">
+          Screenshots: <span id="screenshotCount">0</span>
+        </div>
+      </div>
+      <div class="status" id="status"></div>
+
+      <!-- Mode toggles at the top -->
+      <div class="mode-toggle">
+        <label class="toggle-container">
+          <input type="checkbox" id="accumulateMode" />
+          <span class="toggle-slider"></span>
+          <span class="toggle-label">Accumulate Mode</span>
+        </label>
+      </div>
+      <div class="mode-toggle">
+        <label class="toggle-container">
+          <input type="checkbox" id="fullPageMode" />
+          <span class="toggle-slider"></span>
+          <span class="toggle-label">Full Page Screenshot</span>
+        </label>
+        <div class="mode-description">
+          Automatically scroll and capture entire page
+        </div>
+      </div>
+      <div class="mode-toggle">
+        <label class="toggle-container">
+          <input type="checkbox" id="showInputFields" />
+          <span class="toggle-slider"></span>
+          <span class="toggle-label">Custom Title & Description</span>
+        </label>
+      </div>
+      <div class="mode-toggle">
+        <label class="toggle-container">
+          <input type="checkbox" id="showUploadSection" />
+          <span class="toggle-slider"></span>
+          <span class="toggle-label">Upload from Local</span>
+        </label>
+      </div>
+
+      <!-- Page Number Input (Outside the input section) -->
+      <div
+        class="page-number-section"
+        id="pageNumberSection"
+        style="display: none"
+      >
+        <div class="input-group">
+          <label for="pageNumber">Page Number:</label>
+          <input
+            type="number"
+            id="pageNumber"
+            min="1"
+            value="1"
+            placeholder="1"
+          />
+        </div>
+      </div>
+      <!-- Title and Description Input Section (Hidden by default) -->
+      <div class="input-section" id="inputSection" style="display: none">
+        <div class="input-group">
+          <label for="screenshotTitle">Title:</label>
+          <input
+            type="text"
+            id="screenshotTitle"
+            placeholder="Enter title (optional)"
+          />
+        </div>
+        <div class="input-group">
+          <label for="screenshotDescription">Description:</label>
+          <textarea
+            id="screenshotDescription"
+            placeholder="Enter description (optional)"
+            rows="2"
+          ></textarea>
+        </div>
+      </div>
+      <!-- File Upload Section (Hidden by default) -->
+      <div class="upload-section" id="uploadSection" style="display: none">
+        <div class="upload-area" id="uploadArea">
+          <div class="upload-icon">📁</div>
+          <div class="upload-text">
+            <strong>Drop images here or click to browse</strong>
+            <br />
+            <small>Supports PNG, JPG, JPEG files</small>
+          </div>
+          <input
+            type="file"
+            id="fileInput"
+            accept="image/*"
+            multiple
+            style="display: none"
+          />
+        </div>
+      </div>
+      <!-- Compact Button Layout (2 per row, updated names) -->
+      <div class="buttons">
+        <div class="button-row">
+          <button id="captureBtn" class="btn primary compact">
+            📸 Capture
+          </button>
+          <button id="downloadSingleBtn" class="btn secondary compact" disabled>
+            📄 Current Page
+          </button>
+        </div>
+        <div class="button-row">
+          <button id="downloadAllBtn" class="btn success compact" disabled>
+            📁 Download
+          </button>
+          <button id="clearBtn" class="btn danger compact" disabled>
+            🗑️ Clear All
+          </button>
+        </div>
+      </div>
+      <div class="preview-section" id="previewSection" style="display: none">
+        <h3>Screenshots Preview</h3>
+        <div id="previewContainer"></div>
+      </div>
+      <!-- Full Page Preview Modal -->
+      <div class="modal" id="previewModal" style="display: none">
+        <div class="modal-content">
+          <div class="modal-header">
+            <h3 id="modalTitle">Screenshot Preview</h3>
+            <button class="modal-close" id="modalClose">×</button>
+          </div>
+          <div class="modal-body">
+            <img id="modalImage" src="" alt="Screenshot Preview" />
+            <div class="modal-info">
+              <p><strong>Title:</strong> <span id="modalImageTitle"></span></p>
+              <p><strong>URL:</strong> <span id="modalImageUrl"></span></p>
+              <p>
+                <strong>Timestamp:</strong>
+                <span id="modalImageTimestamp"></span>
+              </p>
+              <p>
+                <strong>Description:</strong>
+                <span id="modalImageDescription"></span>
+              </p>
+            </div>
+          </div>
+          <div class="modal-footer">
+            <button class="btn danger" id="modalDelete">Delete</button>
+            <button class="btn secondary" id="modalClose2">Close</button>
+          </div>
+        </div>
+      </div>
+    </div>
+    <script src="libs/jspdf.umd.min.js"></script>
+    <script src="popup.js"></script>
+  </body>
+</html>
