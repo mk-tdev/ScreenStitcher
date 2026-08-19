@@ -1,0 +1,9 @@
+{
+  "name": "screenstitcher",
+  "version": "1.0.0",
+  "private": true,
+  "description": "Capture browser screenshots and export them as PDFs",
+  "scripts": {
+    "test": "node --check background.js && node --check content.js && node --check popup.js && node scripts/validate-extension.mjs && node scripts/test-content-script.mjs"
+  }
+}

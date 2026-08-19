@@ -1,184 +1,104 @@
 # ScreenStitcher
 
-A powerful Chrome extension for capturing screenshots and converting them to PDF documents. ScreenStitcher allows you to capture individual screenshots or accumulate multiple screenshots to create comprehensive PDF collections.
+ScreenStitcher is a Manifest V3 Chrome extension that captures the visible browser viewport or a full webpage and exports screenshots as PDF documents. Captures can be downloaded immediately or collected into a multi-page PDF.
 
 ## Features
 
-### 📸 Screenshot Capture
-
-- **Visible Area Capture**: Capture the currently visible portion of any webpage
-- **Full Page Capture**: Automatically scroll and capture entire web pages
-- **High-Quality Screenshots**: Uses html2canvas for crisp, high-resolution captures
-- **Smart Sticky Element Handling**: Automatically hides sticky elements during full-page captures
-
-### 📄 PDF Generation
-
-- **Single Screenshot PDF**: Download individual screenshots as PDF
-- **Multi-Screenshot PDF**: Combine multiple screenshots into a single PDF document
-- **Automatic Page Sizing**: Intelligently adjusts PDF page size based on content
-- **Custom Titles & Descriptions**: Add metadata to each screenshot
-
-### 🎛️ Advanced Modes
-
-- **Accumulate Mode**: Collect multiple screenshots before downloading
-- **Custom Title & Description**: Add personalized titles and descriptions to screenshots
-- **Page Numbering**: Automatic page numbering for organized collections
-- **Local File Upload**: Upload and include local images in your collections
-
-### 🖼️ Image Management
-
-- **Preview Gallery**: Visual preview of all captured screenshots
-- **Individual Management**: View, delete, or manage individual screenshots
-- **Drag & Drop Upload**: Easy file upload with drag-and-drop support
-- **Multiple Format Support**: Supports PNG, JPG, and JPEG files
+- Fast browser-native visible-area capture using Chrome's tab capture API
+- Full-page capture by scrolling, hiding repeated fixed elements, and stitching sections
+- Layout-aware scroll settling instead of fixed per-section delays
+- Bounded capture retries and Chrome capture-rate throttling
+- Restoration of the original page position after a full-page capture
+- Automatic page-state restoration if capture is interrupted
+- Immediate single-capture PDF downloads
+- Accumulate mode for multi-screenshot PDF collections
+- Optional rendered title/description headers, plus stored timestamps, URLs, and page numbering
+- Local PNG and JPEG image uploads
+- Preview and deletion of accumulated screenshots
+- Full-page PDF pagination across readable A4 pages
+- Local-only persistence; the extension does not send capture data over the network
 
 ## Installation
 
-### From Source
+1. Clone or download this repository.
+2. Open `chrome://extensions/` in Chrome or another Chromium-based browser.
+3. Enable **Developer mode**.
+4. Select **Load unpacked** and choose this directory.
+5. Pin ScreenStitcher to the browser toolbar if desired.
 
-1. Clone or download this repository
-2. Open Chrome and navigate to `chrome://extensions/`
-3. Enable "Developer mode" in the top right corner
-4. Click "Load unpacked" and select the ScreenStitcher folder
-5. The extension will appear in your Chrome toolbar
-
-### Permissions
-
-The extension requires the following permissions:
-
-- `activeTab`: To capture screenshots of the current tab
-- `storage`: To save screenshot data locally
-- `downloads`: To download generated PDF files
-- `scripting`: To inject capture scripts into web pages
-- `host_permissions`: To work on all websites
+After changing source files, use the extension page's reload button to load the new version.
 
 ## Usage
 
-### Basic Screenshot Capture
+### Capture the visible viewport
 
-1. Navigate to any webpage you want to capture
-2. Click the ScreenStitcher extension icon in your toolbar
-3. Click "📸 Capture" to take a screenshot of the visible area
-4. The screenshot will be automatically downloaded as a PDF
+Open the popup and select **Capture View**. When Accumulate Mode is off, ScreenStitcher downloads the capture as a PDF. When it is on, the capture is added to the collection.
 
-### Full Page Capture
+**Quick PDF** always downloads the currently visible viewport without adding it to the collection.
 
-1. Enable "Full Page Screenshot" toggle
-2. Click "📸 Capture" to capture the entire webpage
-3. The extension will automatically scroll and capture the full page
+### Capture a full page
 
-### Accumulate Mode
+Enable **Full Page Screenshot**, then select **Capture Full Page**. ScreenStitcher scrolls through the page, captures overlapping sections, hides fixed or sticky elements after the first section, stitches the result, and restores the original scroll position.
 
-1. Enable "Accumulate Mode" toggle
-2. Capture multiple screenshots using the "📸 Capture" button
-3. Each screenshot will be added to your collection
-4. Click "📁 Download" to download all screenshots as a single PDF
+The capture waits for scrolling and visible images only when necessary. Sections use a small overlap and JPEG working images to reduce capture, stitching, storage, and PDF generation time while maintaining high visual quality.
 
-### Custom Titles and Descriptions
+Pages that Chrome does not allow extensions to inspect, such as `chrome://` pages and the Chrome Web Store, cannot be captured. Very large pages are scaled down to stay within browser canvas limits.
 
-1. Enable "Custom Title & Description" toggle
-2. Enter a title and description for your screenshot
-3. The page number will be automatically incremented
-4. Capture your screenshot with the custom metadata
+### Build a collection
 
-### Upload Local Images
+1. Enable **Accumulate Mode**.
+2. Capture one or more views or full pages.
+3. Optionally enable **Upload from Local** to add images.
+4. Review or remove captures in the preview area.
+5. Select **Download** to generate a combined PDF.
 
-1. Enable both "Accumulate Mode" and "Upload from Local" toggles
-2. Drag and drop image files onto the upload area or click to browse
-3. Uploaded images will be added to your collection with metadata
-4. Download all images as a single PDF
+Captures and settings are stored in `chrome.storage.local`. The extension requests unlimited local storage because high-resolution collections can exceed Chrome's standard extension quota. Clearing the collection removes stored screenshots and resets settings.
 
-## File Structure
+## Architecture
 
-```
-ScreenStitcher/
-├── manifest.json          # Extension manifest
-├── popup.html            # Main popup interface
-├── popup.js              # Main application logic
-├── popup.css             # Styling for the popup
-├── content.js            # Content script for page interaction
-├── background.js         # Background service worker
-├── icons/                # Extension icons
-│   ├── icon16.png
-│   ├── icon48.png
-│   └── icon128.png
-└── libs/                 # Third-party libraries
-    ├── html2canvas.min.js
-    ├── jspdf.umd.min.js
-    └── pdfobject.min.js
+```text
+manifest.json       Extension permissions and entry points
+background.js       Context-menu registration and popup launch
+content.js          On-demand scrolling and sticky-element control
+popup.html          Popup structure
+popup.css           Popup presentation
+popup.js            Capture, stitching, state, upload, preview, and PDF logic
+libs/jspdf.umd.min.js
+                    Bundled jsPDF 2.5.1 PDF generator
+scripts/validate-extension.mjs
+                    Dependency-free manifest and asset validation
 ```
 
-## Technical Details
+The project intentionally has no compilation or bundling step. Third-party runtime code is stored locally to comply with Manifest V3's remote-code restrictions.
 
-### Dependencies
+## Permissions
 
-- **html2canvas**: For high-quality screenshot capture
-- **jsPDF**: For PDF generation and manipulation
-- **PDFObject**: For PDF handling utilities
+- `activeTab`: capture and inspect the tab after a user invokes the extension
+- `contextMenus`: provide the “Capture with ScreenStitcher” page menu
+- `downloads`: save generated PDFs
+- `scripting`: inject the full-page scrolling helper on demand
+- `storage`: persist settings and accumulated captures locally
+- `unlimitedStorage`: support high-resolution screenshot collections
 
-### Browser Compatibility
+The extension does not request persistent access to every website.
 
-- Chrome (Manifest V3)
-- Chromium-based browsers (Edge, Brave, etc.)
+## Development and validation
 
-### Storage
+Node.js is only needed for validation; the extension itself has no npm dependencies.
 
-- Uses Chrome's local storage API
-- Screenshots are stored as base64 data URLs
-- Settings and preferences are persisted across sessions
+```sh
+npm test
+```
 
-## Development
+The validation command checks JavaScript syntax, parses the manifest, verifies referenced assets, detects duplicate popup IDs, rejects remote popup scripts, and tests the content-script capture/restoration lifecycle. Functional capture testing still requires loading the unpacked extension in a Chromium browser.
 
-### Prerequisites
+## Current limitations
 
-- Chrome browser with developer mode enabled
-- Basic understanding of Chrome extension development
-
-### Building
-
-No build process required - the extension runs directly from source files.
-
-### Testing
-
-1. Load the extension in developer mode
-2. Test on various websites with different layouts
-3. Verify PDF generation and download functionality
-4. Test with different image formats and sizes
-
-## Contributing
-
-1. Fork the repository
-2. Create a feature branch
-3. Make your changes
-4. Test thoroughly
-5. Submit a pull request
+- Browser-protected pages cannot be captured.
+- Continuously growing infinite-scroll pages stop after 100 sections rather than running indefinitely.
+- Very tall pages are downscaled to Chrome's maximum canvas dimension.
+- Fixed elements are retained in the first section and hidden in subsequent sections; complex sites may still produce seams.
 
 ## License
 
-This project is open source. Please check the license file for specific terms.
-
-## Support
-
-For issues, feature requests, or questions:
-
-1. Check the existing issues on GitHub
-2. Create a new issue with detailed information
-3. Include browser version and steps to reproduce
-
-## Changelog
-
-### Version 1.0
-
-- Initial release
-- Basic screenshot capture functionality
-- PDF generation
-- Accumulate mode
-- Full page capture
-- Local file upload
-- Custom titles and descriptions
-- Preview gallery
-- Drag and drop support
-
----
-
-**ScreenStitcher** - Capture, organize, and convert your web content into beautiful PDF documents.
+No license has been selected yet. Add a license file before distributing or accepting external contributions.

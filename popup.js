@@ -1,3 +1,17 @@
+const STORAGE_KEYS = [
+  "screenshots",
+  "accumulateMode",
+  "fullPageMode",
+  "showInputFields",
+  "showUploadSection",
+  "screenshotCounter",
+  "currentPageNumber",
+];
+const CAPTURE_MIN_INTERVAL_MS = 525;
+const CAPTURE_JPEG_QUALITY = 94;
+const FULL_PAGE_OVERLAP_RATIO = 0.04;
+const MAX_FULL_PAGE_SECTIONS = 100;
+
 class ScreenStitcher {
   constructor() {
     this.screenshots = [];
@@ -7,6 +21,8 @@ class ScreenStitcher {
     this.showUploadSection = false;
     this.screenshotCounter = 0;
     this.currentPageNumber = 1;
+    this.isBusy = false;
+    this.lastCaptureStartedAt = 0;
     this.init();
   }
 
@@ -14,33 +30,28 @@ class ScreenStitcher {
     await this.loadData();
     this.bindEvents();
     this.updateUI();
-
-    // Pre-inject html2canvas into active tab
-    try {
-      const [tab] = await chrome.tabs.query({
-        active: true,
-        currentWindow: true,
-      });
-      await chrome.scripting.executeScript({
-        target: { tabId: tab.id },
-        files: ["libs/html2canvas.min.js"],
-      });
-    } catch (error) {
-      console.error("Failed to pre-load html2canvas:", error);
-    }
   }
 
   async loadData() {
-    const data = await chrome.storage.local.get([
-      "screenshots",
-      "accumulateMode",
-      "fullPageMode",
-      "showInputFields",
-      "showUploadSection",
-      "screenshotCounter",
-      "currentPageNumber",
-    ]);
-    this.screenshots = data.screenshots || [];
+    const data = await chrome.storage.local.get(STORAGE_KEYS);
+    const storedScreenshots = Array.isArray(data.screenshots)
+      ? data.screenshots
+      : [];
+    let migrated = false;
+    this.screenshots = storedScreenshots.map((storedScreenshot) => {
+      let screenshot = storedScreenshot;
+      if ("originalDataUrl" in screenshot) {
+        const { originalDataUrl: _originalDataUrl, ...smallerScreenshot } =
+          screenshot;
+        screenshot = smallerScreenshot;
+        migrated = true;
+      }
+      if (!screenshot.isFullPage && screenshot.pageTitle?.includes("(Full Page)")) {
+        screenshot = { ...screenshot, isFullPage: true };
+        migrated = true;
+      }
+      return screenshot;
+    });
     this.accumulateMode = data.accumulateMode || false;
     this.fullPageMode = data.fullPageMode || false;
     this.showInputFields = data.showInputFields || false;
@@ -69,6 +80,7 @@ class ScreenStitcher {
     } else {
       uploadSection.style.display = "none";
     }
+    if (migrated) await this.saveData();
   }
 
   async saveData() {
@@ -81,6 +93,22 @@ class ScreenStitcher {
       screenshotCounter: this.screenshotCounter,
       currentPageNumber: this.currentPageNumber,
     });
+  }
+
+  async getActiveTab() {
+    const [tab] = await chrome.tabs.query({
+      active: true,
+      currentWindow: true,
+    });
+    if (!tab?.id || tab.windowId === undefined) {
+      throw new Error("No active browser tab is available");
+    }
+    return tab;
+  }
+
+  setBusy(isBusy) {
+    this.isBusy = isBusy;
+    this.updateUI();
   }
 
   bindEvents() {
@@ -205,7 +233,8 @@ class ScreenStitcher {
     document.getElementById("pageNumber").value = this.currentPageNumber;
     const title = titleInput || `Page ${pageNum}`;
     const currentTime = new Date().toLocaleString();
-    const baseDescription = `${currentTime}\n${tab.url}`;
+    const pageUrl = (tab.url || "Unknown page").slice(0, 500);
+    const baseDescription = `${currentTime}\n${pageUrl}`;
     const description = descriptionInput
       ? `${baseDescription}\n${descriptionInput}`
       : baseDescription;
@@ -239,11 +268,10 @@ class ScreenStitcher {
   }
 
   async captureScreenshot() {
+    if (this.isBusy) return;
+    this.setBusy(true);
     try {
-      const [tab] = await chrome.tabs.query({
-        active: true,
-        currentWindow: true,
-      });
+      const tab = await this.getActiveTab();
       if (this.fullPageMode) {
         await this.captureFullPage(tab);
       } else {
@@ -256,61 +284,19 @@ class ScreenStitcher {
       this.updateUI();
     } catch (error) {
       console.error("Capture failed:", error);
-      this.showStatus("Failed to capture screenshot", "error");
+      this.showStatus(`Capture failed: ${error.message}`, "error");
+    } finally {
+      this.setBusy(false);
     }
   }
 
   async captureVisibleArea(tab) {
     this.showStatus("Capturing screenshot...", "success");
-
-    // Capture the screenshot using html2canvas
-    const [result] = await chrome.scripting.executeScript({
-      target: { tabId: tab.id },
-      func: async () => {
-        // Wait for any animations/transitions to complete
-        await new Promise((resolve) => setTimeout(resolve, 500));
-
-        const canvas = await html2canvas(document.documentElement, {
-          useCORS: true,
-          scale: window.devicePixelRatio,
-          logging: false,
-          allowTaint: true,
-          backgroundColor: null,
-          foreignObjectRendering: true,
-          removeContainer: false,
-          x: window.scrollX,
-          y: window.scrollY,
-          scrollX: window.scrollX,
-          scrollY: window.scrollY,
-          windowWidth: document.documentElement.clientWidth,
-          windowHeight: document.documentElement.clientHeight,
-          onclone: (clonedDoc) => {
-            // Ensure all styles are computed and applied
-            const styles = window.getComputedStyle(document.documentElement);
-            clonedDoc.documentElement.style.cssText = Array.from(styles).reduce(
-              (str, property) => {
-                return `${str}${property}:${styles.getPropertyValue(
-                  property
-                )};`;
-              },
-              ""
-            );
-          },
-        });
-        return canvas.toDataURL("image/png", 1.0);
-      },
-    });
-
-    const dataUrl = result.result;
+    const dataUrl = await this.captureCurrentViewport(tab);
     const metadata = this.generateScreenshotMetadata(tab);
-    const screenshotWithTitle = await this.addTitleToScreenshot(
-      dataUrl,
-      metadata.title,
-      metadata.description
-    );
+    const screenshotWithTitle = await this.decorateScreenshot(dataUrl, metadata);
     const screenshot = {
       dataUrl: screenshotWithTitle,
-      originalDataUrl: dataUrl,
       timestamp: Date.now(),
       url: tab.url,
       title: metadata.title,
@@ -323,116 +309,129 @@ class ScreenStitcher {
       this.showStatus(`Screenshot "${metadata.title}" captured!`, "success");
     } else {
       await this.downloadPDF([screenshot], "screenshot");
+      await this.saveData();
       this.showStatus("Screenshot downloaded!", "success");
     }
   }
 
-  async captureFullPage(tab) {
-    this.showStatus("Preparing full page capture...", "success");
-    try {
-      // Get the full page dimensions and capture the screenshot
-      const [result] = await chrome.scripting.executeScript({
-        target: { tabId: tab.id },
-        func: async () => {
-          // Wait for any animations/transitions to complete
-          await new Promise((resolve) => setTimeout(resolve, 500));
-
-          // Get full page dimensions
-          const body = document.body;
-          const html = document.documentElement;
-          const height = Math.max(
-            body.scrollHeight,
-            body.offsetHeight,
-            html.clientHeight,
-            html.scrollHeight,
-            html.offsetHeight
-          );
-
-          // Configure html2canvas for full page
-          const canvas = await html2canvas(document.documentElement, {
-            useCORS: true,
-            scale: window.devicePixelRatio,
-            logging: false,
-            allowTaint: true,
-            backgroundColor: null,
-            height: height,
-            windowHeight: height,
-            foreignObjectRendering: true,
-            removeContainer: false,
-            x: window.scrollX,
-            y: window.scrollY,
-            scrollX: window.scrollX,
-            scrollY: window.scrollY,
-            windowWidth: document.documentElement.clientWidth,
-            onclone: (clonedDoc) => {
-              // Ensure all styles are computed and applied
-              const styles = window.getComputedStyle(document.documentElement);
-              clonedDoc.documentElement.style.cssText = Array.from(
-                styles
-              ).reduce((str, property) => {
-                return `${str}${property}:${styles.getPropertyValue(
-                  property
-                )};`;
-              }, "");
-            },
-          });
-          return canvas.toDataURL("image/png", 1.0);
-        },
-      });
-
-      const dataUrl = result.result;
-      const metadata = this.generateScreenshotMetadata(tab);
-      const screenshotWithTitle = await this.addTitleToScreenshot(
-        dataUrl,
-        metadata.title,
-        metadata.description
-      );
-      const fullPageScreenshot = {
-        dataUrl: screenshotWithTitle,
-        originalDataUrl: dataUrl,
-        timestamp: Date.now(),
-        url: tab.url,
-        title: metadata.title,
-        description: metadata.description,
-        pageTitle: tab.title + " (Full Page)",
-      };
-
-      if (this.accumulateMode) {
-        this.screenshots.push(fullPageScreenshot);
-        await this.saveData();
-        this.showStatus(
-          `Full page screenshot "${metadata.title}" captured!`,
-          "success"
-        );
-      } else {
-        await this.downloadPDF([fullPageScreenshot], "fullpage-screenshot");
-        this.showStatus("Full page screenshot downloaded!", "success");
+  async captureCurrentViewport(tab) {
+    let lastError;
+    for (let attempt = 0; attempt < 3; attempt++) {
+      const elapsed = performance.now() - this.lastCaptureStartedAt;
+      if (
+        this.lastCaptureStartedAt > 0 &&
+        elapsed < CAPTURE_MIN_INTERVAL_MS
+      ) {
+        await this.sleep(CAPTURE_MIN_INTERVAL_MS - elapsed);
       }
-    } catch (error) {
-      console.error("Full page capture failed:", error);
-      this.showStatus("Failed to capture full page: " + error.message, "error");
+      this.lastCaptureStartedAt = performance.now();
+      try {
+        return await chrome.tabs.captureVisibleTab(tab.windowId, {
+          format: "jpeg",
+          quality: CAPTURE_JPEG_QUALITY,
+        });
+      } catch (error) {
+        lastError = error;
+        if (attempt < 2) await this.sleep(250 * (attempt + 1));
+      }
+    }
+    throw new Error(`Unable to capture the viewport: ${lastError.message}`);
+  }
+
+  async captureFullPage(tab) {
+    const startedAt = performance.now();
+    this.showStatus("Preparing full page capture...", "success");
+    await this.ensureContentScriptInjected(tab.id);
+    const pageInfo = await this.getPageDimensionsWithRetry(tab.id);
+    if (!pageInfo) throw new Error("Unable to measure this page");
+
+    const captureResult = await this.captureWithSelectiveSticky(tab, pageInfo);
+    const { screenshots: sections, pageInfo: capturedPageInfo } = captureResult;
+    if (sections.length === 0) {
+      throw new Error("No page sections could be captured");
+    }
+
+    const dataUrl = await this.createSeamlessImage(sections, capturedPageInfo);
+    const metadata = this.generateScreenshotMetadata(tab);
+    const screenshotWithTitle = await this.decorateScreenshot(dataUrl, metadata);
+    const fullPageScreenshot = {
+      dataUrl: screenshotWithTitle,
+      timestamp: Date.now(),
+      url: tab.url,
+      title: metadata.title,
+      description: metadata.description,
+      pageTitle: `${tab.title} (Full Page)`,
+      isFullPage: true,
+    };
+    if (this.accumulateMode) {
+      this.screenshots.push(fullPageScreenshot);
+      await this.saveData();
+      const elapsedSeconds = ((performance.now() - startedAt) / 1000).toFixed(1);
+      this.showStatus(
+        `Full page screenshot "${metadata.title}" captured in ${elapsedSeconds}s!`,
+        "success"
+      );
+    } else {
+      await this.downloadPDF([fullPageScreenshot], "fullpage-screenshot");
+      await this.saveData();
+      const elapsedSeconds = ((performance.now() - startedAt) / 1000).toFixed(1);
+      this.showStatus(
+        `Full page screenshot downloaded in ${elapsedSeconds}s!`,
+        "success"
+      );
     }
   }
 
+  async decorateScreenshot(dataUrl, metadata) {
+    if (!this.showInputFields) return dataUrl;
+    return this.addTitleToScreenshot(
+      dataUrl,
+      metadata.title,
+      metadata.description
+    );
+  }
+
   async addTitleToScreenshot(dataUrl, title, description) {
-    return new Promise((resolve) => {
+    return new Promise((resolve, reject) => {
       const img = new Image();
       img.onload = () => {
         const canvas = document.createElement("canvas");
-        const ctx = canvas.getContext("2d");
         const padding = 15;
-        const lineHeight = 16;
-        const titleHeight = 20;
-        const descriptionLines = description.split("\n");
+        const maxCanvasDimension = 31000;
+        let imageScale = Math.min(
+          1,
+          maxCanvasDimension / img.width,
+          31000 / img.height
+        );
+        let renderedWidth = Math.max(1, Math.round(img.width * imageScale));
+        let renderedHeight = Math.max(1, Math.round(img.height * imageScale));
+        canvas.width = Math.max(320, renderedWidth);
+        const ctx = canvas.getContext("2d");
+        const maxWidth = canvas.width - padding * 2;
+
+        ctx.font = "bold 16px Arial, sans-serif";
+        const titleLines = this.wrapText(ctx, title, maxWidth);
+        ctx.font = "12px Arial, sans-serif";
+        const descriptionLines = description
+          .split("\n")
+          .flatMap((line) => this.wrapText(ctx, line, maxWidth));
+        const titleLineHeight = 20;
+        const descriptionLineHeight = 16;
         const headerHeight =
-          titleHeight +
           padding +
-          descriptionLines.length * lineHeight +
+          titleLines.length * titleLineHeight +
+          5 +
+          descriptionLines.length * descriptionLineHeight +
           padding;
-        canvas.width = img.width;
-        canvas.height = img.height + headerHeight;
+
+        if (renderedHeight + headerHeight > maxCanvasDimension) {
+          imageScale = (maxCanvasDimension - headerHeight) / img.height;
+          renderedWidth = Math.max(1, Math.round(img.width * imageScale));
+          renderedHeight = Math.max(1, Math.round(img.height * imageScale));
+        }
+        canvas.height = renderedHeight + headerHeight;
         ctx.fillStyle = "#ffffff";
-        ctx.fillRect(0, 0, canvas.width, headerHeight);
+        ctx.fillRect(0, 0, canvas.width, canvas.height);
         ctx.strokeStyle = "#e0e0e0";
         ctx.lineWidth = 1;
         ctx.beginPath();
@@ -443,36 +442,58 @@ class ScreenStitcher {
         ctx.textAlign = "left";
         ctx.textBaseline = "top";
         ctx.font = "bold 16px Arial, sans-serif";
-        ctx.fillText(title, padding, padding);
+        let y = padding;
+        titleLines.forEach((line) => {
+          ctx.fillText(line, padding, y);
+          y += titleLineHeight;
+        });
         ctx.font = "12px Arial, sans-serif";
         ctx.fillStyle = "#666666";
-        let y = padding + titleHeight + 5;
-        const maxWidth = canvas.width - padding * 2;
+        y += 5;
         descriptionLines.forEach((line) => {
-          const words = line.split(" ");
-          let currentLine = "";
-          for (let i = 0; i < words.length; i++) {
-            const testLine = currentLine + words[i] + " ";
-            const metrics = ctx.measureText(testLine);
-            const testWidth = metrics.width;
-            if (testWidth > maxWidth && i > 0) {
-              ctx.fillText(currentLine, padding, y);
-              currentLine = words[i] + " ";
-              y += lineHeight;
-            } else {
-              currentLine = testLine;
-            }
-          }
-          if (currentLine.trim()) {
-            ctx.fillText(currentLine, padding, y);
-            y += lineHeight;
-          }
+          ctx.fillText(line, padding, y);
+          y += descriptionLineHeight;
         });
-        ctx.drawImage(img, 0, headerHeight);
-        resolve(canvas.toDataURL("image/png", 1.0));
+        ctx.drawImage(
+          img,
+          (canvas.width - renderedWidth) / 2,
+          headerHeight,
+          renderedWidth,
+          renderedHeight
+        );
+        resolve(canvas.toDataURL("image/jpeg", 0.94));
       };
+      img.onerror = () => reject(new Error("Unable to decode captured image"));
       img.src = dataUrl;
     });
+  }
+
+  wrapText(ctx, text, maxWidth) {
+    if (!text) return [""];
+    const lines = [];
+    let currentLine = "";
+    for (const word of text.split(/\s+/)) {
+      const candidate = currentLine ? `${currentLine} ${word}` : word;
+      if (ctx.measureText(candidate).width <= maxWidth) {
+        currentLine = candidate;
+        continue;
+      }
+      if (currentLine) lines.push(currentLine);
+      currentLine = word;
+      while (ctx.measureText(currentLine).width > maxWidth) {
+        let splitAt = currentLine.length - 1;
+        while (
+          splitAt > 1 &&
+          ctx.measureText(currentLine.slice(0, splitAt)).width > maxWidth
+        ) {
+          splitAt--;
+        }
+        lines.push(currentLine.slice(0, splitAt));
+        currentLine = currentLine.slice(splitAt);
+      }
+    }
+    if (currentLine) lines.push(currentLine);
+    return lines.length > 0 ? lines : [""];
   }
 
   async ensureContentScriptInjected(tabId) {
@@ -483,7 +504,7 @@ class ScreenStitcher {
         target: { tabId: tabId },
         files: ["content.js"],
       });
-      await this.sleep(500);
+      await this.sendMessageWithRetry(tabId, { action: "ping" });
     }
   }
 
@@ -496,7 +517,7 @@ class ScreenStitcher {
         if (response) return response;
       } catch (error) {
         if (i === maxRetries - 1) throw error;
-        await this.sleep(1000);
+        await this.sleep(150);
       }
     }
     return null;
@@ -509,7 +530,7 @@ class ScreenStitcher {
         return response;
       } catch (error) {
         if (i === maxRetries - 1) throw error;
-        await this.sleep(500);
+        await this.sleep(150);
       }
     }
   }
@@ -517,202 +538,233 @@ class ScreenStitcher {
   async captureWithSelectiveSticky(tab, pageInfo) {
     const screenshots = [];
     const viewportHeight = pageInfo.viewportHeight;
-    const totalHeight = pageInfo.scrollHeight;
-    const stickyElements = pageInfo.stickyElements || [];
-    const overlapPixels = Math.floor(viewportHeight * 0.15);
+    let stickyElements = [];
+    const overlapPixels = Math.max(
+      24,
+      Math.floor(viewportHeight * FULL_PAGE_OVERLAP_RATIO)
+    );
     const effectiveStepSize = viewportHeight - overlapPixels;
-    const scrollSteps =
-      Math.ceil((totalHeight - viewportHeight) / effectiveStepSize) + 1;
-    await this.sendMessageWithRetry(tab.id, { action: "scrollToTop" });
-    await this.sleep(1000);
-    for (let i = 0; i < scrollSteps; i++) {
-      let scrollY;
-      if (i === 0) {
-        scrollY = 0;
-      } else if (i === scrollSteps - 1) {
-        scrollY = totalHeight - viewportHeight;
-        if (stickyElements.length > 0) {
+    const estimatedSections = Math.max(
+      1,
+      Math.ceil((pageInfo.scrollHeight - viewportHeight) / effectiveStepSize) + 1
+    );
+    let targetY = 0;
+    let latestPageInfo = pageInfo;
+
+    try {
+      await this.sendMessageWithRetry(tab.id, { action: "beginCapture" });
+      for (let i = 0; i < MAX_FULL_PAGE_SECTIONS; i++) {
+        if (i === 1 && stickyElements.length > 0) {
           await this.sendMessageWithRetry(tab.id, {
             action: "hideStickyElements",
           });
-          await this.sleep(300);
         }
-      } else {
-        scrollY = i * effectiveStepSize;
-        if (stickyElements.length > 0) {
-          await this.sendMessageWithRetry(tab.id, {
-            action: "hideStickyElements",
-          });
-          await this.sleep(300);
-        }
-      }
-      try {
-        await this.sendMessageWithRetry(tab.id, {
+        const settledState = await this.sendMessageWithRetry(tab.id, {
           action: "scrollToPosition",
-          y: scrollY,
+          y: targetY,
         });
-        await this.sleep(800);
-        const actualPosition = await this.sendMessageWithRetry(tab.id, {
-          action: "getScrollPosition",
+        if (!settledState?.success) {
+          throw new Error(
+            settledState?.error || "The page did not finish scrolling"
+          );
+        }
+        const dataUrl = await this.captureCurrentViewport(tab);
+        const currentState = await this.sendMessageWithRetry(tab.id, {
+          action: "getPageState",
         });
-        const dataUrl = await chrome.tabs.captureVisibleTab(tab.windowId, {
-          format: "png",
-          quality: 100,
-        });
+        const state = {
+          ...settledState,
+          ...currentState,
+          actualY: currentState.currentScrollY,
+        };
+        const isLast =
+          state.actualY + state.viewportHeight >= state.scrollHeight - 2;
         screenshots.push({
           dataUrl,
-          plannedScrollY: scrollY,
-          actualScrollY: actualPosition.y,
-          viewportHeight,
+          plannedScrollY: targetY,
+          actualScrollY: state.actualY,
+          viewportHeight: state.viewportHeight,
           step: i,
           isFirst: i === 0,
-          isLast: i === scrollSteps - 1,
-          devicePixelRatio: pageInfo.devicePixelRatio || 1,
+          isLast,
+          devicePixelRatio: state.devicePixelRatio || 1,
           stickyHidden: i > 0,
         });
-        if (i > 0 && i < scrollSteps - 1 && stickyElements.length > 0) {
-          await this.sendMessageWithRetry(tab.id, {
-            action: "showStickyElements",
-          });
-          await this.sleep(200);
-        }
+        latestPageInfo = {
+          ...latestPageInfo,
+          ...state,
+          scrollHeight: Math.max(
+            latestPageInfo.scrollHeight,
+            state.scrollHeight,
+            state.actualY + state.viewportHeight
+          ),
+        };
         this.showStatus(
-          `Capturing section ${i + 1}/${scrollSteps}...`,
+          `Captured section ${i + 1}/~${estimatedSections}...`,
           "success"
         );
-      } catch (error) {
-        console.error(`Failed to capture step ${i + 1}:`, error);
+        if (isLast) break;
+        if (i === 0) {
+          const stickyState = await this.sendMessageWithRetry(tab.id, {
+            action: "detectStickyElements",
+          });
+          stickyElements = stickyState?.stickyElements || [];
+        }
+
+        const nextY = Math.min(
+          state.scrollHeight - state.viewportHeight,
+          state.actualY + effectiveStepSize
+        );
+        if (nextY <= state.actualY + 1) {
+          screenshots[screenshots.length - 1].isLast = true;
+          break;
+        }
+        targetY = nextY;
+
+        if (i === MAX_FULL_PAGE_SECTIONS - 1) {
+          throw new Error(
+            "This page kept growing during capture; stopped after 100 sections"
+          );
+        }
       }
+    } finally {
+      await this.sendMessageWithRetry(tab.id, { action: "endCapture" }).catch(
+        () => {}
+      );
     }
-    await this.sendMessageWithRetry(tab.id, { action: "showStickyElements" });
-    await this.sendMessageWithRetry(tab.id, { action: "scrollToTop" });
-    return screenshots;
+    return { screenshots, pageInfo: latestPageInfo };
   }
 
   async createSeamlessImage(screenshots, pageInfo) {
-    return new Promise((resolve) => {
-      const canvas = document.createElement("canvas");
-      const ctx = canvas.getContext("2d");
-      const firstImg = new Image();
-      firstImg.onload = () => {
-        const canvasWidth = firstImg.width;
-        const canvasHeight = Math.round(
-          (pageInfo.scrollHeight / pageInfo.viewportHeight) * firstImg.height
-        );
-        canvas.width = canvasWidth;
-        canvas.height = canvasHeight;
-        ctx.imageSmoothingEnabled = true;
-        ctx.imageSmoothingQuality = "high";
-        ctx.fillStyle = "#ffffff";
-        ctx.fillRect(0, 0, canvasWidth, canvasHeight);
-        let loadedCount = 0;
-        const images = [];
-        screenshots.forEach((screenshot, index) => {
-          const img = new Image();
-          img.onload = () => {
-            images[index] = img;
-            loadedCount++;
-            if (loadedCount === screenshots.length) {
-              this.stitchImagesSeamlessly(
-                ctx,
-                images,
-                screenshots,
-                pageInfo,
-                canvasWidth,
-                canvasHeight
-              );
-              resolve(canvas.toDataURL("image/png", 1.0));
-            }
-          };
-          img.src = screenshot.dataUrl;
-        });
-      };
-      firstImg.src = screenshots[0].dataUrl;
-    });
+    if (screenshots.length === 0) {
+      throw new Error("No screenshots to stitch");
+    }
+    const firstImage = await this.loadImage(screenshots[0].dataUrl);
+    const rawCanvasHeight = Math.round(
+      (pageInfo.scrollHeight / pageInfo.viewportHeight) * firstImage.height
+    );
+    const maxCanvasDimension = 31000;
+    const outputScale = Math.min(
+      1,
+      maxCanvasDimension / firstImage.width,
+      maxCanvasDimension / rawCanvasHeight
+    );
+    const canvasWidth = Math.max(
+      1,
+      Math.round(firstImage.width * outputScale)
+    );
+    const canvasHeight = Math.max(
+      1,
+      Math.round(rawCanvasHeight * outputScale)
+    );
+    const canvas = document.createElement("canvas");
+    canvas.width = canvasWidth;
+    canvas.height = canvasHeight;
+    const ctx = canvas.getContext("2d");
+    ctx.imageSmoothingEnabled = true;
+    ctx.imageSmoothingQuality = "high";
+    ctx.fillStyle = "#ffffff";
+    ctx.fillRect(0, 0, canvasWidth, canvasHeight);
+
+    for (let index = 0; index < screenshots.length; index++) {
+      const image =
+        index === 0
+          ? firstImage
+          : await this.loadImage(screenshots[index].dataUrl);
+      this.drawScreenshotSection(
+        ctx,
+        image,
+        screenshots[index],
+        pageInfo,
+        canvasWidth,
+        canvasHeight,
+        firstImage.width
+      );
+    }
+
+    const stitchedImage = canvas.toDataURL("image/jpeg", 0.92);
+    if (!stitchedImage.startsWith("data:image/jpeg")) {
+      throw new Error("The browser could not encode the full-page image");
+    }
+    return stitchedImage;
   }
 
-  stitchImagesSeamlessly(
+  drawScreenshotSection(
     ctx,
-    images,
-    screenshots,
+    image,
+    screenshot,
     pageInfo,
     canvasWidth,
-    canvasHeight
+    canvasHeight,
+    sourceWidth
   ) {
     const scaleFactor = canvasWidth / pageInfo.viewportWidth;
-    screenshots.forEach((screenshot, index) => {
-      const img = images[index];
-      if (!img) return;
-      let drawY;
-      if (screenshot.isFirst) {
-        drawY = 0;
-      } else if (screenshot.isLast) {
-        drawY = canvasHeight - img.height;
-      } else {
-        drawY = screenshot.actualScrollY * scaleFactor;
-      }
-      drawY = Math.max(0, Math.min(drawY, canvasHeight - img.height));
-      ctx.drawImage(
-        img,
-        0,
-        0,
-        img.width,
-        img.height,
-        0,
-        drawY,
-        img.width,
-        img.height
-      );
-    });
+    const imageScaleFactor = canvasWidth / sourceWidth;
+    const drawWidth = image.width * imageScaleFactor;
+    const drawHeight = image.height * imageScaleFactor;
+    let drawY;
+    if (screenshot.isFirst) {
+      drawY = 0;
+    } else if (screenshot.isLast) {
+      drawY = canvasHeight - drawHeight;
+    } else {
+      drawY = screenshot.actualScrollY * scaleFactor;
+    }
+    drawY = Math.max(0, Math.min(drawY, canvasHeight - drawHeight));
+    ctx.drawImage(
+      image,
+      0,
+      0,
+      image.width,
+      image.height,
+      0,
+      drawY,
+      drawWidth,
+      drawHeight
+    );
   }
 
   async downloadSingle() {
+    if (this.isBusy) return;
+    this.setBusy(true);
     try {
-      const [tab] = await chrome.tabs.query({
-        active: true,
-        currentWindow: true,
-      });
-      if (this.fullPageMode) {
-        await this.captureFullPage(tab);
-      } else {
-        const dataUrl = await chrome.tabs.captureVisibleTab(tab.windowId, {
-          format: "png",
-          quality: 100,
-        });
-        const metadata = this.generateScreenshotMetadata(tab);
-        const screenshotWithTitle = await this.addTitleToScreenshot(
-          dataUrl,
-          metadata.title,
-          metadata.description
-        );
-        await this.downloadPDF(
-          [
-            {
-              dataUrl: screenshotWithTitle,
-              originalDataUrl: dataUrl,
-              timestamp: Date.now(),
-              url: tab.url,
-              title: metadata.title,
-              description: metadata.description,
-              pageTitle: tab.title,
-            },
-          ],
-          "screenshot"
-        );
-        if (this.showInputFields) {
-          document.getElementById("screenshotTitle").value = "";
-          document.getElementById("screenshotDescription").value = "";
-        }
-        this.showStatus("PDF downloaded!", "success");
+      const tab = await this.getActiveTab();
+      const dataUrl = await this.captureCurrentViewport(tab);
+      const metadata = this.generateScreenshotMetadata(tab);
+      const screenshotWithTitle = await this.decorateScreenshot(
+        dataUrl,
+        metadata
+      );
+      await this.downloadPDF(
+        [
+          {
+            dataUrl: screenshotWithTitle,
+            timestamp: Date.now(),
+            url: tab.url,
+            title: metadata.title,
+            description: metadata.description,
+            pageTitle: tab.title,
+          },
+        ],
+        "screenshot"
+      );
+      await this.saveData();
+      if (this.showInputFields) {
+        document.getElementById("screenshotTitle").value = "";
+        document.getElementById("screenshotDescription").value = "";
       }
+      this.showStatus("PDF downloaded!", "success");
     } catch (error) {
       console.error("Download failed:", error);
-      this.showStatus("Failed to download PDF", "error");
+      this.showStatus(`Download failed: ${error.message}`, "error");
+    } finally {
+      this.setBusy(false);
     }
   }
 
   async downloadAll() {
-    if (this.screenshots.length === 0) return;
+    if (this.screenshots.length === 0 || this.isBusy) return;
+    this.setBusy(true);
     try {
       await this.downloadPDF(this.screenshots, "screenshots-collection");
       this.showStatus(
@@ -721,116 +773,151 @@ class ScreenStitcher {
       );
     } catch (error) {
       console.error("Download all failed:", error);
-      this.showStatus("Failed to download PDF", "error");
+      this.showStatus(`Download failed: ${error.message}`, "error");
+    } finally {
+      this.setBusy(false);
     }
   }
 
   async downloadPDF(screenshots, filename) {
+    if (screenshots.length === 0) {
+      throw new Error("No screenshots are available");
+    }
     const { jsPDF } = window.jspdf;
-    let pdf;
+    let pdf = null;
+    const addPage = (orientation) => {
+      if (!pdf) {
+        pdf = new jsPDF({
+          orientation,
+          unit: "mm",
+          format: "a4",
+          compress: true,
+        });
+      } else {
+        pdf.addPage("a4", orientation);
+      }
+      const pageWidth = pdf.internal.pageSize.getWidth();
+      const pageHeight = pdf.internal.pageSize.getHeight();
+      pdf.setFillColor(255, 255, 255);
+      pdf.rect(0, 0, pageWidth, pageHeight, "F");
+      return { pageWidth, pageHeight };
+    };
+
     for (let i = 0; i < screenshots.length; i++) {
       const screenshot = screenshots[i];
-      const img = new Image();
-      img.src = screenshot.dataUrl;
-      await new Promise((resolve) => {
-        img.onload = () => {
-          const imgWidth = img.width;
-          const imgHeight = img.height;
-          const imgRatio = imgWidth / imgHeight;
-          if (i === 0) {
-            if (screenshot.title && screenshot.title.includes("Full Page")) {
-              const mmPerPixel = 0.264583;
-              const pdfWidth = Math.min(imgWidth * mmPerPixel, 210);
-              const pdfHeight = (pdfWidth / imgWidth) * imgHeight;
-              pdf = new jsPDF("p", "mm", [pdfWidth, pdfHeight]);
-            } else {
-              if (imgRatio > 1.4) {
-                pdf = new jsPDF("l", "mm", "a4");
-              } else {
-                pdf = new jsPDF("p", "mm", "a4");
-              }
-            }
-          } else {
-            pdf.addPage();
+      const img = await this.loadImage(screenshot.dataUrl);
+      const imgRatio = img.width / img.height;
+      const imageFormat = this.getImageFormat(screenshot.dataUrl);
+
+      if (screenshot.isFullPage) {
+        const orientation = imgRatio > 1 ? "landscape" : "portrait";
+        let { pageWidth, pageHeight } = addPage(orientation);
+        const drawWidth = pageWidth;
+        const drawHeight = drawWidth / imgRatio;
+        const pageCount = Math.max(1, Math.ceil(drawHeight / pageHeight));
+        const imageAlias = `full-page-${i}`;
+        for (let pageIndex = 0; pageIndex < pageCount; pageIndex++) {
+          if (pageIndex > 0) {
+            ({ pageWidth, pageHeight } = addPage(orientation));
           }
-          const pageWidth = pdf.internal.pageSize.getWidth();
-          const pageHeight = pdf.internal.pageSize.getHeight();
-          if (screenshot.title && screenshot.title.includes("Full Page")) {
-            pdf.addImage(
-              screenshot.dataUrl,
-              "PNG",
-              0,
-              0,
-              pageWidth,
-              pageHeight,
-              undefined,
-              "FAST"
-            );
-          } else {
-            const pageRatio = pageWidth / pageHeight;
-            let drawWidth, drawHeight, offsetX, offsetY;
-            if (imgRatio > pageRatio) {
-              drawWidth = pageWidth;
-              drawHeight = pageWidth / imgRatio;
-              offsetX = 0;
-              offsetY = (pageHeight - drawHeight) / 2;
-            } else {
-              drawHeight = pageHeight;
-              drawWidth = pageHeight * imgRatio;
-              offsetX = (pageWidth - drawWidth) / 2;
-              offsetY = 0;
-            }
-            pdf.setFillColor(255, 255, 255);
-            pdf.rect(0, 0, pageWidth, pageHeight, "F");
-            pdf.addImage(
-              screenshot.dataUrl,
-              "PNG",
-              offsetX,
-              offsetY,
-              drawWidth,
-              drawHeight,
-              undefined,
-              "FAST"
-            );
-          }
-          resolve();
-        };
-      });
+          pdf.addImage(
+            screenshot.dataUrl,
+            imageFormat,
+            0,
+            -pageIndex * pageHeight,
+            pageWidth,
+            drawHeight,
+            imageAlias,
+            "FAST"
+          );
+        }
+        continue;
+      }
+
+      const orientation = imgRatio > 1.4 ? "landscape" : "portrait";
+      const { pageWidth, pageHeight } = addPage(orientation);
+      const pageRatio = pageWidth / pageHeight;
+      let drawWidth;
+      let drawHeight;
+      if (imgRatio > pageRatio) {
+        drawWidth = pageWidth;
+        drawHeight = pageWidth / imgRatio;
+      } else {
+        drawHeight = pageHeight;
+        drawWidth = pageHeight * imgRatio;
+      }
+      pdf.addImage(
+        screenshot.dataUrl,
+        imageFormat,
+        (pageWidth - drawWidth) / 2,
+        (pageHeight - drawHeight) / 2,
+        drawWidth,
+        drawHeight,
+        `screenshot-${i}`,
+        "FAST"
+      );
     }
+
+    pdf.setProperties({ title: filename });
     const pdfBlob = pdf.output("blob");
     const url = URL.createObjectURL(pdfBlob);
-    await chrome.downloads.download({
-      url: url,
-      filename: `${filename}-${new Date()
-        .toISOString()
-        .slice(0, 19)
-        .replace(/:/g, "-")}.pdf`,
+    try {
+      await chrome.downloads.download({
+        url,
+        filename: `${filename}-${new Date()
+          .toISOString()
+          .slice(0, 19)
+          .replace(/:/g, "-")}.pdf`,
+      });
+    } finally {
+      URL.revokeObjectURL(url);
+    }
+  }
+
+  loadImage(dataUrl) {
+    return new Promise((resolve, reject) => {
+      const img = new Image();
+      img.onload = () => resolve(img);
+      img.onerror = () => reject(new Error("Unable to decode screenshot"));
+      img.src = dataUrl;
     });
   }
 
+  getImageFormat(dataUrl) {
+    return dataUrl.startsWith("data:image/jpeg") ? "JPEG" : "PNG";
+  }
+
   async clearAll() {
-    this.showStatus("Clearing all data...", "success");
-    this.screenshots = [];
-    this.screenshotCounter = 0;
-    this.currentPageNumber = 1;
-    document.getElementById("screenshotTitle").value = "";
-    document.getElementById("screenshotDescription").value = "";
-    document.getElementById("pageNumber").value = 1;
-    await chrome.storage.local.clear();
-    this.accumulateMode = false;
-    this.fullPageMode = false;
-    this.showInputFields = false;
-    this.showUploadSection = false;
-    document.getElementById("accumulateMode").checked = false;
-    document.getElementById("fullPageMode").checked = false;
-    document.getElementById("showInputFields").checked = false;
-    document.getElementById("showUploadSection").checked = false;
-    document.getElementById("inputSection").style.display = "none";
-    document.getElementById("pageNumberSection").style.display = "none";
-    document.getElementById("uploadSection").style.display = "none";
-    await this.saveData();
-    this.updateUI();
-    this.showStatus("All screenshots and data cleared!", "success");
+    if (this.isBusy) return;
+    this.setBusy(true);
+    try {
+      this.showStatus("Clearing all data...", "success");
+      this.screenshots = [];
+      this.screenshotCounter = 0;
+      this.currentPageNumber = 1;
+      document.getElementById("screenshotTitle").value = "";
+      document.getElementById("screenshotDescription").value = "";
+      document.getElementById("pageNumber").value = 1;
+      await chrome.storage.local.remove(STORAGE_KEYS);
+      this.accumulateMode = false;
+      this.fullPageMode = false;
+      this.showInputFields = false;
+      this.showUploadSection = false;
+      document.getElementById("accumulateMode").checked = false;
+      document.getElementById("fullPageMode").checked = false;
+      document.getElementById("showInputFields").checked = false;
+      document.getElementById("showUploadSection").checked = false;
+      document.getElementById("inputSection").style.display = "none";
+      document.getElementById("pageNumberSection").style.display = "none";
+      document.getElementById("uploadSection").style.display = "none";
+      await this.saveData();
+      this.showStatus("All screenshots and settings cleared!", "success");
+    } catch (error) {
+      console.error("Clear failed:", error);
+      this.showStatus(`Clear failed: ${error.message}`, "error");
+    } finally {
+      this.setBusy(false);
+    }
   }
 
   triggerFileUpload() {
@@ -864,6 +951,7 @@ class ScreenStitcher {
   }
 
   async processUploadedFiles(files) {
+    if (this.isBusy) return;
     if (!this.accumulateMode) {
       this.showStatus(
         "Please enable Accumulate Mode to upload images",
@@ -878,65 +966,73 @@ class ScreenStitcher {
       );
       return;
     }
-    const imageFiles = files.filter((file) => file.type.startsWith("image/"));
+    const supportedImageTypes = new Set(["image/png", "image/jpeg"]);
+    const imageFiles = files.filter((file) =>
+      supportedImageTypes.has(file.type)
+    );
     if (imageFiles.length === 0) {
       this.showStatus("No valid image files selected", "error");
       return;
     }
+    this.setBusy(true);
     this.showStatus(`Processing ${imageFiles.length} image(s)...`, "success");
     const uploadArea = document.getElementById("uploadArea");
     const overlay = document.createElement("div");
     overlay.className = "processing-overlay";
     overlay.innerHTML = `<div class="processing-spinner"></div>Processing images...`;
     uploadArea.appendChild(overlay);
-    let processedCount = 0;
-    for (const file of imageFiles) {
-      try {
-        await this.processUploadedImage(file);
-        processedCount++;
+    try {
+      const tab = await this.getActiveTab();
+      let processedCount = 0;
+      for (const file of imageFiles) {
+        try {
+          await this.processUploadedImage(file, tab);
+          processedCount++;
+          this.showStatus(
+            `Processed ${processedCount}/${imageFiles.length} images`,
+            "success"
+          );
+        } catch (error) {
+          console.error("Error processing file:", file.name, error);
+          this.showStatus(
+            `Error processing ${file.name}: ${error.message}`,
+            "error"
+          );
+        }
+      }
+      if (processedCount > 0) {
+        await this.saveData();
         this.showStatus(
-          `Processed ${processedCount}/${imageFiles.length} images`,
+          `Successfully added ${processedCount} image(s)!`,
           "success"
         );
-      } catch (error) {
-        console.error("Error processing file:", file.name, error);
-        this.showStatus(`Error processing ${file.name}`, "error");
+        if (this.showInputFields) {
+          document.getElementById("screenshotTitle").value = "";
+          document.getElementById("screenshotDescription").value = "";
+        }
       }
-    }
-    uploadArea.removeChild(overlay);
-    if (processedCount > 0) {
-      await this.saveData();
-      this.updateUI();
-      this.showStatus(
-        `Successfully added ${processedCount} image(s)!`,
-        "success"
-      );
-      if (this.showInputFields) {
-        document.getElementById("screenshotTitle").value = "";
-        document.getElementById("screenshotDescription").value = "";
-      }
+    } catch (error) {
+      console.error("Upload failed:", error);
+      this.showStatus(`Upload failed: ${error.message}`, "error");
+    } finally {
+      overlay.remove();
+      this.setBusy(false);
     }
   }
 
-  async processUploadedImage(file) {
+  async processUploadedImage(file, tab) {
     return new Promise((resolve, reject) => {
       const reader = new FileReader();
       reader.onload = async (e) => {
         try {
           const dataUrl = e.target.result;
-          const [tab] = await chrome.tabs.query({
-            active: true,
-            currentWindow: true,
-          });
           const metadata = this.generateUploadMetadata(file, tab);
-          const imageWithTitle = await this.addTitleToScreenshot(
+          const imageWithTitle = await this.decorateScreenshot(
             dataUrl,
-            metadata.title,
-            metadata.description
+            metadata
           );
           const screenshot = {
             dataUrl: imageWithTitle,
-            originalDataUrl: dataUrl,
             timestamp: Date.now(),
             url: tab.url,
             title: metadata.title,
@@ -1044,9 +1140,9 @@ class ScreenStitcher {
     this.closeModal();
   }
 
-  removeScreenshot(index) {
+  async removeScreenshot(index) {
     this.screenshots.splice(index, 1);
-    this.saveData();
+    await this.saveData();
     this.updateUI();
   }
 
@@ -1057,9 +1153,9 @@ class ScreenStitcher {
     const downloadAllBtn = document.getElementById("downloadAllBtn");
     const clearBtn = document.getElementById("clearBtn");
     const previewSection = document.getElementById("previewSection");
-    downloadSingleBtn.disabled = this.accumulateMode && count === 0;
-    downloadAllBtn.disabled = count === 0;
-    clearBtn.disabled = count === 0;
+    downloadSingleBtn.disabled = this.isBusy;
+    downloadAllBtn.disabled = this.isBusy || count === 0;
+    clearBtn.disabled = this.isBusy;
     if (count > 0 && this.accumulateMode) {
       previewSection.style.display = "block";
       this.updatePreview();
@@ -1067,13 +1163,13 @@ class ScreenStitcher {
       previewSection.style.display = "none";
     }
     const captureBtn = document.getElementById("captureBtn");
-    if (this.fullPageMode) {
-      captureBtn.innerHTML = "📸 Capture";
-      downloadSingleBtn.innerHTML = "📄 Current Page";
-    } else {
-      captureBtn.innerHTML = "📸 Capture";
-      downloadSingleBtn.innerHTML = "📄 Current Page";
-    }
+    captureBtn.disabled = this.isBusy;
+    captureBtn.textContent = this.isBusy
+      ? "⏳ Working..."
+      : this.fullPageMode
+      ? "📸 Capture Full Page"
+      : "📸 Capture View";
+    downloadSingleBtn.textContent = "📄 Quick PDF";
     downloadAllBtn.innerHTML = "📁 Download";
   }
 

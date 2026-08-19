@@ -71,6 +71,7 @@
           <input
             type="text"
             id="screenshotTitle"
+            maxlength="120"
             placeholder="Enter title (optional)"
           />
         </div>
@@ -78,6 +79,7 @@
           <label for="screenshotDescription">Description:</label>
           <textarea
             id="screenshotDescription"
+            maxlength="500"
             placeholder="Enter description (optional)"
             rows="2"
           ></textarea>
@@ -95,7 +97,7 @@
           <input
             type="file"
             id="fileInput"
-            accept="image/*"
+            accept="image/png,image/jpeg,.png,.jpg,.jpeg"
             multiple
             style="display: none"
           />
@@ -105,10 +107,10 @@
       <div class="buttons">
         <div class="button-row">
           <button id="captureBtn" class="btn primary compact">
-            📸 Capture
+            📸 Capture View
           </button>
-          <button id="downloadSingleBtn" class="btn secondary compact" disabled>
-            📄 Current Page
+          <button id="downloadSingleBtn" class="btn secondary compact">
+            📄 Quick PDF
           </button>
         </div>
         <div class="button-row">
