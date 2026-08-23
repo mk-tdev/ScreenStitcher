@@ -1,6 +1,6 @@
 {
   "name": "screenstitcher",
-  "version": "1.0.0",
+  "version": "1.1.0",
   "private": true,
   "description": "Capture browser screenshots and export them as PDFs",
   "scripts": {
